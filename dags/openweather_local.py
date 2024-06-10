@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta
 import os
-import requests
 import json
 import pandas as pd
 from sklearn.model_selection import cross_val_score
@@ -11,8 +10,8 @@ from joblib import dump
 
 from airflow import DAG
 from airflow.operators.python_operator import PythonOperator
+from airflow.sensors.python import PythonSensor
 from airflow.utils.task_group import TaskGroup
-from airflow.models import Variable
 
 # Define the default arguments for the DAG
 default_args = {
@@ -24,41 +23,6 @@ default_args = {
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
 }
-
-import os
-
-def fetch_weather_data(**kwargs):
-    cities = Variable.get("cities", deserialize_json=True)
-    api_key = "36174e6314d900c4ea70a58dd2c85d4a"  # Replace with your actual API key
-
-    parent_folder = "/app/raw_files"
-    os.makedirs(parent_folder, exist_ok=True)  # Ensure the directory exists
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    filename = f"{timestamp}.json"
-    file_path = os.path.join(parent_folder, filename)
-
-    data = []
-    for city in cities:
-        url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
-        response = requests.get(url)
-        if response.status_code == 200:
-            data.append(response.json())
-        else:
-            print(f"Error fetching data for {city}: {response.status_code}")
-
-    with open(file_path, "w") as f:
-        json.dump(data, f)
-
-# Define the function to transform data into CSV
-import os
-import json
-import pandas as pd
-from sklearn.model_selection import cross_val_score
-from sklearn.linear_model import LinearRegression
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.ensemble import RandomForestRegressor
-from joblib import dump
 
 def transform_data_into_csv(n_files=None, filename='data.csv'):
     parent_folder = '/app/raw_files'
@@ -92,16 +56,13 @@ def transform_data_into_csv(n_files=None, filename='data.csv'):
 
     df.to_csv(os.path.join(clean_data_folder, filename), index=False)
 
-# Define the function to transform data for the latest 20 files
 def transform_latest_data(**kwargs):
     transform_data_into_csv(n_files=20, filename='data.csv')
 
-# Define the function to transform data for all files
 def transform_all_data(**kwargs):
     transform_data_into_csv(filename='fulldata.csv')
 
 def compute_model_score(model, X, y):
-    # computing cross val
     cross_validation = cross_val_score(
         model,
         X,
@@ -114,40 +75,21 @@ def compute_model_score(model, X, y):
     return model_score
 
 def prepare_data(path_to_data='/app/clean_data/fulldata.csv'):
-    # reading data
     df = pd.read_csv(path_to_data)
-    # ordering data according to city and date
     df = df.sort_values(['city', 'date'], ascending=True)
 
     dfs = []
 
     for c in df['city'].unique():
         df_temp = df[df['city'] == c]
-
-        # creating target
         df_temp.loc[:, 'target'] = df_temp['temperature'].shift(1)
-
-        # creating features
         for i in range(1, 10):
-            df_temp.loc[:, 'temp_m-{}'.format(i)
-                        ] = df_temp['temperature'].shift(-i)
-
-        # deleting null values
+            df_temp.loc[:, 'temp_m-{}'.format(i)] = df_temp['temperature'].shift(-i)
         df_temp = df_temp.dropna()
-
         dfs.append(df_temp)
 
-    # concatenating datasets
-    df_final = pd.concat(
-        dfs,
-        axis=0,
-        ignore_index=False
-    )
-
-    # deleting date variable
+    df_final = pd.concat(dfs, axis=0, ignore_index=False)
     df_final = df_final.drop(['date'], axis=1)
-
-    # creating dummies for city variable
     df_final = pd.get_dummies(df_final)
 
     features = df_final.drop(['target'], axis=1)
@@ -162,9 +104,7 @@ def train_and_evaluate_model(model_name, model, **kwargs):
     kwargs['ti'].xcom_push(key=model_name, value=model_score)
 
 def train_and_save_model(model, X, y, path_to_model='./app/clean_data/best_model.pickle'):
-    # training the model
     model.fit(X, y)
-    # saving model
     model_folder = os.path.dirname(path_to_model)
     os.makedirs(model_folder, exist_ok=True)  # Ensure the directory exists
     print(str(model), 'saved at ', path_to_model)
@@ -188,10 +128,17 @@ def select_best_model(**kwargs):
 
     train_and_save_model(model, X, y, path_to_model='./app/clean_data/best_model.pickle')
 
-with DAG('weather_data_pipeline', default_args=default_args, schedule_interval='*/1 * * * *') as dag:
-    fetch_data_task = PythonOperator(
-        task_id='fetch_weather_data',
-        python_callable=fetch_weather_data,
+def check_for_20_files():
+    parent_folder = '/app/raw_files'
+    return len([name for name in os.listdir(parent_folder) if os.path.isfile(os.path.join(parent_folder, name))]) >= 20
+
+with DAG('weather_data_pipeline', default_args=default_args, schedule_interval=None) as dag:
+    file_sensor_task = PythonSensor(
+        task_id='check_for_20_files',
+        python_callable=check_for_20_files,
+        mode='poke',
+        poke_interval=60,  # Check every minute
+        timeout=600,  # Timeout after 10 minutes
     )
 
     with TaskGroup('transform_data_group') as transform_data_group:
@@ -218,7 +165,7 @@ with DAG('weather_data_pipeline', default_args=default_args, schedule_interval='
             op_kwargs={'model_name': 'DecisionTreeRegressor', 'model': DecisionTreeRegressor()}
         )
         
-        train__random_forest_task = PythonOperator(
+        train_random_forest_task = PythonOperator(
             task_id='train_random_forest',
             python_callable=train_and_evaluate_model,
             op_kwargs={'model_name': 'RandomForestRegressor', 'model': RandomForestRegressor()}
@@ -232,4 +179,4 @@ with DAG('weather_data_pipeline', default_args=default_args, schedule_interval='
 # Set dependencies
 select_best_model_task << train_evaluate_model_group
 train_evaluate_model_group << transform_data_group
-transform_data_group << fetch_data_task
+transform_data_group << file_sensor_task
